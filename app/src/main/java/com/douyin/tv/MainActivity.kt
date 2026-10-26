@@ -435,6 +435,58 @@ class MainActivity : AppCompatActivity() {
                 try { Object.defineProperty(navigator, 'platform', { get: () => 'Win32' }); } catch(e) {}
                 try { window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} }; } catch(e) {}
                 try { Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 }); } catch(e) {}
+                /* ===== TV 遥控器桥接:沉浸模式视频导航 ===== */
+                if (!window.__tvNav) {
+                    window.__tvState = function() {
+                        var best = null, bestScore = 0;
+                        try {
+                            document.querySelectorAll('video').forEach(function(v) {
+                                var r = v.getBoundingClientRect();
+                                if (r.width < 80 || r.height < 80) return;
+                                var s = Math.min(r.width, window.innerWidth) * Math.min(r.height, window.innerHeight);
+                                if (s > bestScore) { bestScore = s; best = v; }
+                            });
+                        } catch(e) {}
+                        return best;
+                    };
+                    window.__tvImmersive = function() {
+                        var v = window.__tvState();
+                        try { return v && v.getBoundingClientRect().height > window.innerHeight * 0.55; } catch(e) { return false; }
+                    };
+                    /* dir: -1上一个 / 1下一个。沉浸模式派发官方播放器支持的滚轮事件 */
+                    window.__tvNav = function(dir) {
+                        if (!window.__tvImmersive()) return 'grid';
+                        try {
+                            var v = window.__tvState();
+                            var x = window.innerWidth / 2, y = window.innerHeight / 2;
+                            var t = document.elementFromPoint(x, y) || v;
+                            t.dispatchEvent(new WheelEvent('wheel', {
+                                bubbles: true, cancelable: true, composed: true,
+                                deltaY: dir * 600, deltaMode: 0, clientX: x, clientY: y
+                            }));
+                            return 'wheel';
+                        } catch(e) { return 'grid'; }
+                    };
+                    /* OK键:沉浸模式切换暂停/播放 */
+                    window.__tvCenter = function() {
+                        if (!window.__tvImmersive()) return 'grid';
+                        try {
+                            var v = window.__tvState();
+                            if (v.paused) { v.play(); } else { v.pause(); }
+                            return 'video';
+                        } catch(e) { return 'grid'; }
+                    };
+                    /* 左/右键:沉浸模式快退/快进10秒 */
+                    window.__tvSeek = function(dir) {
+                        if (!window.__tvImmersive()) return 'grid';
+                        try {
+                            var v = window.__tvState();
+                            v.currentTime = Math.max(0, (v.currentTime || 0) + dir * 10);
+                            return 'video';
+                        } catch(e) { return 'grid'; }
+                    };
+                    console.log('[TV] remote bridge installed');
+                }
             })();
         """.trimIndent()
         webView.evaluateJavascript(script, null)
@@ -685,11 +737,14 @@ class MainActivity : AppCompatActivity() {
         lastKeyEventTime = currentTime
 
         return when (keyCode) {
-            KeyEvent.KEYCODE_DPAD_UP -> { focusEngineNavigate(0, -1); true }
-            KeyEvent.KEYCODE_DPAD_DOWN -> { focusEngineNavigate(0, 1); true }
-            KeyEvent.KEYCODE_DPAD_LEFT -> { focusEngineNavigate(-1, 0); true }
-            KeyEvent.KEYCODE_DPAD_RIGHT -> { focusEngineNavigate(1, 0); true }
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { focusEngineAction(); true }
+            // 沉浸模式(全屏视频)下:上/下=滚轮切换视频;宫格模式回退到焦点引擎
+            KeyEvent.KEYCODE_DPAD_UP -> { navigateFeedOrGrid(-1); true }
+            KeyEvent.KEYCODE_DPAD_DOWN -> { navigateFeedOrGrid(1); true }
+            // 沉浸模式下:左/右=快退/快进10秒;宫格模式回退到焦点引擎
+            KeyEvent.KEYCODE_DPAD_LEFT -> { seekOrNavigate(-1); true }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> { seekOrNavigate(1); true }
+            // 沉浸模式下:OK=暂停/播放;宫格模式回退到焦点引擎点击
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> { centerAction(); true }
             KeyEvent.KEYCODE_BACK -> {
                 if (tryExitVideoFullscreen()) true
                 else if (webView.canGoBack()) { webView.goBack(); true }
@@ -700,6 +755,37 @@ class MainActivity : AppCompatActivity() {
             KeyEvent.KEYCODE_MEDIA_PLAY -> { playVideo(); true }
             KeyEvent.KEYCODE_MEDIA_PAUSE -> { pauseVideo(); true }
             else -> false
+        }
+    }
+
+    /**
+     * 沉浸模式导航层:判断当前是否为全屏视频(如点开视频后的播放弹层),
+     * 是则用官方支持的滚轮事件切换视频,否则回退到宫格焦点引擎。
+     */
+    private fun navigateFeedOrGrid(dir: Int) {
+        evaluateWithCallback("window.__tvNav ? window.__tvNav($dir) : 'grid'") { res ->
+            if (res != "wheel") focusEngineNavigate(0, dir)
+        }
+    }
+
+    private fun centerAction() {
+        evaluateWithCallback("window.__tvCenter ? window.__tvCenter() : 'grid'") { res ->
+            if (res != "video") focusEngineAction()
+        }
+    }
+
+    private fun seekOrNavigate(dir: Int) {
+        evaluateWithCallback("window.__tvSeek ? window.__tvSeek($dir) : 'grid'") { res ->
+            if (res != "video") focusEngineNavigate(dir, 0)
+        }
+    }
+
+    private fun evaluateWithCallback(script: String, onResult: (String) -> Unit) {
+        webView.evaluateJavascript(script) { result ->
+            runOnUiThread {
+                val value = result?.trim()?.removeSurrounding("\"") ?: ""
+                try { onResult(value) } catch (e: Exception) { Log.e(tag, "evaluateWithCallback error", e) }
+            }
         }
     }
 
